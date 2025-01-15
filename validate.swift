@@ -31,6 +31,7 @@ enum Constants {
 enum AppError: Error {
     case invalidURL(URL)
     case fetchTimeout(URL)
+    case manifestNotFound(URL)
     case networkingError(Error)
     case noData(URL)
     case notFound(URL)
@@ -45,17 +46,19 @@ enum AppError: Error {
     var localizedDescription: String {
         switch self {
             case .invalidURL(let url):
-                return "invalid url: \(url.absoluteString)"
+                return "invalid url: \(url)"
             case .fetchTimeout(let url):
-                return "timeout while fetching url: \(url.absoluteString)"
+                return "timeout while fetching url: \(url)"
+            case .manifestNotFound(let url):
+                return "no package manifest found at url: \(url)"
             case .networkingError(let error):
                 return "networking error: \(error.localizedDescription)"
             case .noData(let url):
-                return "no data returned from url: \(url.absoluteString)"
+                return "no data returned from url: \(url)"
             case .notFound(let url):
-                return "url not found (404): \(url.absoluteString)"
+                return "url not found (404): \(url)"
             case .outputIdentical:
-                return "resulting package.json is unchanged"
+                return "resulting package.json is unchanged. This typically means the package is already in the index."
             case .packageDumpError(let msg):
                 return "package dump failed: \(msg)"
             case .packageDumpTimeout:
@@ -65,7 +68,7 @@ enum AppError: Error {
             case .packageMoved:
                 return "package moved"
             case let .rateLimitExceeded(url, limit):
-                return "rate limit of \(limit) exceeded while requesting url: \(url.absoluteString)"
+                return "rate limit of \(limit) exceeded while requesting url: \(url)"
             case .syntaxError(let msg):
                 return msg
         }
@@ -258,13 +261,47 @@ func getDefaultBranch(owner: String, repository: String) throws -> String {
     return try JSONDecoder().decode(Repository.self, from: json).default_branch
 }
 
-func getManifestURL(_ url: URL) throws -> URL {
+struct RepoFile: Codable {
+    var type: String
+    var path: String
+}
+
+func parseOwnerRepo(from url: URL) -> (owner: String, repository: String) {
     let repository = (url.pathExtension.lowercased() == "git")
         ? url.deletingPathExtension().lastPathComponent
         : url.lastPathComponent
     let owner = url.deletingLastPathComponent().lastPathComponent
-    let defaultBranch = try getDefaultBranch(owner: owner, repository: repository)
-    return URL(string: "https://raw.githubusercontent.com/\(owner)/\(repository)/\(defaultBranch)/Package.swift")!
+    return (owner, repository)
+}
+
+func listFilesInRepo(owner: String, repository: String, branch: String) throws -> [RepoFile] {
+    let apiURL = URL(string: "https://api.github.com/repos/\(owner)/\(repository)/git/trees/\(branch)")!
+    let json = try fetch(apiURL)
+    struct Response: Codable {
+        var tree: [RepoFile]
+    }
+    do {
+        return try JSONDecoder().decode(Response.self, from: json).tree
+    } catch {
+        print("failed to parse listFilesInRepo response:")
+        print(String(decoding: json, as: UTF8.self))
+        throw error
+    }
+}
+
+func getManifestURLs(_ url: URL) throws -> [URL] {
+    let (owner, repository) = parseOwnerRepo(from: url)
+    let branch = try getDefaultBranch(owner: owner, repository: repository)
+    let manifestFiles = try listFilesInRepo(owner: owner, repository: repository, branch: branch)
+      .filter { $0.type == "blob" }
+      .filter { $0.path.hasPrefix("Package") }
+      .filter { $0.path.hasSuffix(".swift") }
+      .map(\.path)
+      .sorted()
+    guard !manifestFiles.isEmpty else { throw AppError.manifestNotFound(url) }
+    return manifestFiles.map {
+        URL(string: "https://raw.githubusercontent.com/\(owner)/\(repository)/\(branch)/\($0)")!
+    }
 }
 
 func createTempDir() throws -> URL {
@@ -316,18 +353,20 @@ func runDumpPackage(at path: URL, timeout: TimeInterval = 20) throws -> Data {
 
 @discardableResult
 func dumpPackage(url: URL) throws -> Package {
-    let manifestURL = try getManifestURL(url)
-    let manifest = try fetch(manifestURL)
-
     let tempDir = try createTempDir()
-    let fileURL = tempDir.appendingPathComponent("Package.swift")
-    try manifest.write(to: fileURL)
+    
+    for manifestURL in try getManifestURLs(url) {
+        let manifest = try fetch(manifestURL)
+        let fileURL = tempDir.appendingPathComponent(manifestURL.lastPathComponent)
+        try manifest.write(to: fileURL)
+    }
 
     let json = try runDumpPackage(at: tempDir)
     return try JSONDecoder().decode(Package.self, from: json)
 }
 
 func verifyURL(_ url: URL) throws -> URL {
+    print("verifying", url)
     guard let resolvedURL = url.followingRedirects() else { throw AppError.invalidURL(url) }
     try dumpPackage(url: resolvedURL)
     return resolvedURL

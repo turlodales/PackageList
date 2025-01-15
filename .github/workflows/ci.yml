@@ -9,7 +9,7 @@ on:
     types: [submitted]
 
 env:
-  SWIFT_IMAGE: swiftlang/swift:nightly-5.7-focal
+  SWIFT_IMAGE: swift:6.0.1-jammy
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Validate JSON
         run: docker run --rm --env GITHUB_TOKEN=$GITHUB_TOKEN -v "$PWD:/host" -w /host $SWIFT_IMAGE swift validate.swift
